@@ -1,6 +1,6 @@
 package com.johnlpage.pocdriver;
 
-import com.mongodb.MongoClient;
+import com.mongodb.client.MongoClient;
 import com.mongodb.bulk.BulkWriteResult;
 import com.mongodb.client.MongoCollection;
 import com.mongodb.client.MongoCursor;
@@ -44,6 +44,8 @@ public class MongoWorker implements Runnable {
     private int maxCollections;
 
     private void ReviewShards() {
+    	String primaryShard = null;
+    	
         //System.out.println("Reviewing chunk distribution");
         if (testOpts.sharded && !testOpts.singleserver) {
             // I'd like to pick a shard and write there - it's going to be
@@ -51,6 +53,14 @@ public class MongoWorker implements Runnable {
             // We can ensure we distribute our workers over out shards
             // So we will tell mongo that's where we want our records to go
             //System.out.println("Sharded and not a single server");
+        	
+        	//We also want to know which is the primary shard as we do not want
+        	//to be moving chinks to where they arready are
+        	
+        	Document dbinfo = mongoClient.getDatabase("config").getCollection("databases").find(new Document("_id",testOpts.databaseName)).first();
+        	
+            if(dbinfo != null) { primaryShard = dbinfo.getString("primary"); }
+        	
             MongoDatabase admindb = mongoClient.getDatabase("admin");
             Boolean split = false;
 
@@ -69,16 +79,19 @@ public class MongoWorker implements Runnable {
                     if (e.getMessage().contains("is a boundary key of existing")) {
                         split = true;
                     } else {
-                        if (!e.getMessage().contains("could not aquire collection lock"))
                             System.out.println(e.getMessage());
                         try {
                             Thread.sleep(1000);
                         } catch (Exception ignored) {
+                        	System.out.println(e.getMessage());
                         }
                     }
                 }
 
             }
+            
+            
+            
             // And move that to a shard - which shard? take my workerid and mod
             // it with the number of shards
             int shardno = workerID % testOpts.numShards;
@@ -87,15 +100,17 @@ public class MongoWorker implements Runnable {
             MongoCursor<Document> shardlist = mongoClient.getDatabase("config")
                     .getCollection("shards").find().skip(shardno).limit(1).iterator();
             //System.out.println("Getting shard name");
-            String shardName = "";
-            while (shardlist.hasNext()) {
-                Document obj = shardlist.next();
-
-                shardName = obj.getString("_id");
-                //System.out.println(shardName);
-            }
-
+            Document obj = mongoClient.getDatabase("config")
+                    .getCollection("shards").find().skip(shardno).first();
+            String shardName = obj.getString("_id");
+            
+           
             boolean move = false;
+            
+            if(primaryShard != null && primaryShard.equals(shardName)) {
+            	move = true; //No need to move if its already there and avoids the hang
+            	             //when you move somethign to a chunk which is donating
+            }
             while (!move) {
                 try {
                     admindb.runCommand(new Document("moveChunk",
@@ -103,18 +118,20 @@ public class MongoWorker implements Runnable {
                             .append("find",
                                     new Document("_id", new Document("w",
                                             workerID).append("i", sequence + 1)))
-                            .append("to", shardName));
+                            .append("to", shardName)
+                            .append("_secondaryThrottle", true)
+                            .append("_waitForDelete", true));
                     move = true;
                 } catch (Exception e) {
                     System.out.println(e.getMessage());
                     if (e.getMessage().contains("that chunk is already on that shard")) {
                         move = true;
                     } else {
-                        if (!e.getMessage().contains("could not aquire collection lock"))
                             System.out.println(e.getMessage());
                         try {
                             Thread.sleep(1000);
                         } catch (Exception ignored) {
+                        	System.out.println(e.getMessage());
                         }
                     }
                 }
@@ -209,18 +226,13 @@ public class MongoWorker implements Runnable {
         Date starttime = new Date();
 
         //This is where ALL writes are happening
-        if (bulkWriter.size() == 0) {
-            System.out.println("No operations to bulk write");
-            return;
-        }
-
         //So this can fail part way through if we have a failover
         //In which case we resubmit it
 
         boolean submitted = false;
         BulkWriteResult bwResult = null;
 
-        while (!submitted) {
+        while (!submitted && !bulkWriter.isEmpty()) {  // can be empty if we removed a Dupe key error
             try {
                 submitted = true;
                 bwResult = coll.bulkWrite(bulkWriter);
@@ -267,6 +279,9 @@ public class MongoWorker implements Runnable {
                 } else {
                     // Some other error occurred - possibly MongoCommandException, MongoTimeoutException
                     System.out.println(e.getClass().getSimpleName() + ": " + error);
+                    // Print a full stacktrace since we're in debug mode
+                    if (testOpts.debug)
+                        e.printStackTrace();
                 }
                 //System.out.println("No result returned");
                 submitted = false;
@@ -282,12 +297,11 @@ public class MongoWorker implements Runnable {
         int ucount = bwResult.getMatchedCount();
 
         // If the bulk op is slow - ALL those ops were slow
-
-        if (taken > testOpts.slowThreshold) {
-            testResults.RecordSlowOp("inserts", icount);
-            testResults.RecordSlowOp("updates", ucount);
-        }
+        recordSlowOps("inserts", taken, icount);
+        recordSlowOps("updates",taken, ucount);
+        
         testResults.RecordOpsDone("inserts", icount);
+        
     }
 
 
@@ -322,9 +336,7 @@ public class MongoWorker implements Runnable {
 
             Date endtime = new Date();
             Long taken = endtime.getTime() - starttime.getTime();
-            if (taken > testOpts.slowThreshold) {
-                testResults.RecordSlowOp("keyqueries", 1);
-            }
+            recordSlowOps("keyqueries", taken, 1);
             testResults.RecordOpsDone("keyqueries", 1);
         }
         return myDoc;
@@ -361,13 +373,20 @@ public class MongoWorker implements Runnable {
 
         Date endtime = new Date();
         Long taken = endtime.getTime() - starttime.getTime();
-        if (taken > testOpts.slowThreshold) {
-            testResults.RecordSlowOp("rangequeries", 1);
-        }
-        testResults.RecordOpsDone("rangequeries", 1);
-
+        recordSlowOps("rangequeries", taken, 1);
+        testResults.RecordOpsDone("rangequeries", 1);   
     }
 
+    private void recordSlowOps(String opname, Long taken, int count){
+        
+        for(int i=0; testOpts.slowThresholds !=null && testOpts.slowThresholds.length>i; i++){
+            int slowThreshold = testOpts.slowThresholds[i];
+            if (taken > slowThreshold) {
+                //testResults.RecordSlowOp("inserts", icount, 50);
+                testResults.RecordSlowOp(opname, count, i);
+            }            
+        }
+    }
     private void rotateCollection() {
         if (maxCollections > 1) {
             coll = colls.get(lastCollection);
@@ -542,9 +561,10 @@ public class MongoWorker implements Runnable {
 
             }
 
-        } catch (Exception e) {
+        } catch (Exception e) {            
             System.out.println("Error: " + e.getMessage());
-            e.printStackTrace();
+            if (testOpts.debug)
+                e.printStackTrace();
         }
     }
 }

@@ -19,7 +19,7 @@ public class POCDriver {
 
         POCTestOptions testOpts;
         LogManager.getLogManager().reset();
-        System.out.println("MongoDB Proof Of Concept - Load Generator");
+        System.out.println("MongoDB Proof Of Concept - Load Generator version 0.1.2");
         try {
             testOpts = new POCTestOptions(args);
             // Quit after displaying help message
@@ -41,7 +41,7 @@ public class POCDriver {
             return;
         }
 
-        POCTestResults testResults = new POCTestResults();
+        POCTestResults testResults = new POCTestResults(testOpts);
         LoadRunner runner = new LoadRunner(testOpts);
         runner.RunLoad(testOpts, testResults);
     }
@@ -94,7 +94,7 @@ public class POCDriver {
         new DocumentCodec().encode(binaryWriter, tr.internalDoc, EncoderContext.builder().build());
         int length = binaryWriter.getBsonOutput().getSize();
 
-        System.out.println(String.format("Records are %.2f KB each as BSON", (float) length / 1024));
+        System.out.println(String.format("Documents are %.2f KB each as BSON", (float) length / 1024));
     }
 
 }
